@@ -1,0 +1,26 @@
+{
+  "name": "opencode-book",
+  "version": "1.0.0",
+  "description": "OpenCode 源码解析 - 开源 AI 编程助手深度解析",
+  "main": "index.js",
+  "scripts": {
+    "docs:dev": "vitepress dev",
+    "docs:build": "vitepress build",
+    "docs:preview": "vitepress preview"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/coolclaws/opencode-book.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/coolclaws/opencode-book/issues"
+  },
+  "homepage": "https://github.com/coolclaws/opencode-book#readme",
+  "devDependencies": {
+    "vitepress": "^1.6.4"
+  },
+  "type": "module"
+}
