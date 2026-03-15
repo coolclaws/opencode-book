@@ -15,6 +15,7 @@ export default defineConfig({
   ],
 
   themeConfig: {
+    logo: { src: '/logo.png', alt: 'OpenCode' },
     nav: [
       { text: '开始阅读', link: '/chapters/01-overview' },
       { text: '目录', link: '/contents' },
