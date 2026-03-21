@@ -218,24 +218,26 @@ export function payloads() {
 
 当 AI 模型返回一个 tool_call 指令时，事件在系统中的传播路径体现了整个事件驱动架构的协作方式。以下序列图展示了一个工具调用从触发到最终在所有客户端上更新显示的完整过程：
 
-```mermaid
-sequenceDiagram
-    participant S as Session/Processor
-    participant Bus as Bus (Instance)
-    participant GB as GlobalBus
-    participant TUI as TUI (SyncProvider)
-    participant SSE as SSE 端点
-    participant App as Desktop App
-
-    S->>S: tool-call 事件触发
-    S->>S: Session.updatePart(tool, running)
-    S->>Bus: publish(PartUpdated, {...})
-    Bus->>TUI: 本地订阅回调
-    TUI->>TUI: SolidJS store 更新 → UI 重绘
-    Bus->>GB: GlobalBus.emit("event", {...})
-    GB->>SSE: /event 端点写入 SSE 流
-    SSE->>App: EventSource 接收
-    App->>App: 更新 Desktop UI
+```text
+Session/Processor      Bus (Instance)      GlobalBus       TUI          SSE 端点      Desktop
+  │                      │                   │              │              │              │
+  │ tool-call 触发       │                   │              │              │              │
+  │ updatePart(running)  │                   │              │              │              │
+  │                      │                   │              │              │              │
+  │  publish(PartUpdated)│                   │              │              │              │
+  │─────────────────────→│                   │              │              │              │
+  │                      │  本地订阅回调     │              │              │              │
+  │                      │──────────────────────────────────→              │              │
+  │                      │                   │              │ store 更新   │              │
+  │                      │                   │              │ → UI 重绘   │              │
+  │                      │                   │              │              │              │
+  │                      │  GlobalBus.emit() │              │              │              │
+  │                      │──────────────────→│              │              │              │
+  │                      │                   │  写入 SSE 流 │              │              │
+  │                      │                   │─────────────────────────────→              │
+  │                      │                   │              │              │ EventSource  │
+  │                      │                   │              │              │─────────────→│
+  │                      │                   │              │              │              │ 更新 UI
 ```
 
 流程从 Session 的 Processor 开始。Processor 解析到 LLM 返回的 tool_call 指令后，首先调用 `Session.updatePart()` 将该工具调用的状态标记为 `running`，然后通过 `Bus.publish(MessageV2.Event.PartUpdated, {...})` 发布一个 part 更新事件。

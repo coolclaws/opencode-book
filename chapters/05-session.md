@@ -42,79 +42,25 @@ export const Info = z.object({
 })
 ```
 
-### 字段完整详解
+### 字段详解
 
-**id** 使用 `SessionID.descending()` 生成。降序前缀确保在数据库中按 ID 排序时，最新的会话自然排在前面，无需额外的 ORDER BY 子句即可实现"最近优先"的列表效果。这是一种在 SQLite 这类嵌入式数据库中常见的性能优化手段——通过数据本身的排列顺序避免排序开销。
+**id** 使用 `SessionID.descending()` 生成，降序前缀确保最新会话在数据库中自然排在前面，无需额外 ORDER BY。**slug** 由 `Slug.create()` 生成，是 URL 安全的短标识，用户可通过 `opencode resume <slug>` 快速恢复会话。
 
-**slug** 由 `Slug.create()` 生成，是一个简短的、URL 安全的标识符。与冗长的 ID 不同，slug 适合出现在分享链接和命令行参数中。用户执行 `opencode resume <slug>` 即可快速恢复会话，不必记忆完整的 Session ID。
+**projectID** 和 **workspaceID** 构成 Session 的"归属坐标"——projectID 是必填的项目绑定，workspaceID 可选，支持多工作区场景。**directory** 记录工作目录路径，工具执行都以此为基准。**parentID** 实现会话层级关系，Task 工具创建的子会话通过此字段指向父 Session，删除时递归清理所有子会话。
 
-**projectID** 和 **workspaceID** 将 Session 绑定到特定的项目和工作区。projectID 是必填字段——每个 Session 必须归属于某个项目。workspaceID 是可选的，支持多工作区场景下的会话隔离。这两个字段共同构成了 Session 的"归属坐标"，使得 list 操作能够按项目和工作区精确筛选。在 `listGlobal` 中还可以跨项目查询，此时会关联 `ProjectTable` 获取项目元信息（名称、worktree 路径），为全局会话视图提供完整上下文。
+**time** 包含四个时间戳，其中 `compacting` 兼具互斥锁和恢复标记的双重功能——压缩启动时写入，完成后清除，异常中断可通过过期时间戳检测。`archived` 标记归档时间，`listGlobal` 默认过滤已归档会话。**permission** 允许会话级别覆盖全局权限规则。**revert** 记录回退元信息（messageID、partID、snapshot、diff），支持精确恢复到任意历史节点。
 
-**directory** 记录会话的工作目录路径。工具执行（如文件读写、终端命令）都以此目录为基准。当用户在不同目录启动 OpenCode 时，每个 Session 都忠实地记录下自己的工作上下文。
-
-**parentID** 是实现会话层级关系的关键。当 Task 工具创建子会话时，子 Session 的 parentID 指向父 Session。删除父会话时，`remove` 函数会递归调用 `children()` 获取所有子会话并逐一删除，避免孤立数据残留。
-
-**summary** 追踪整个会话期间的代码变更统计：新增行数（additions）、删除行数（deletions）、涉及的文件数（files），以及可选的详细差异数组（diffs）。`SessionSummary.summarize()` 在 Processor 的每个 `finish-step` 事件后异步计算这些指标。
-
-**time** 包含四个时间戳，其中 `compacting` 特别值得关注。它兼具互斥锁和恢复标记的双重功能——当上下文压缩启动时写入当前时间戳，压缩完成后清除。如果某次压缩异常中断（例如进程崩溃），系统可以通过检测过期的 compacting 时间戳来判断是否需要恢复。`archived` 标记会话归档时间，`listGlobal` 默认过滤掉已归档的会话（`isNull(SessionTable.time_archived)`），但数据仍然保留，用户可以通过参数 `archived: true` 查看历史。
-
-**permission** 允许在会话级别覆盖全局权限规则。某些 Session 可能需要更宽松或更严格的工具权限，而不影响其他会话。`setPermission` 函数可以在运行时动态修改这个字段。
-
-**revert** 记录回退操作的元信息。`messageID` 指向触发回退的消息，`partID` 精确到具体的 Part。`snapshot` 和 `diff` 保存文件系统状态的快照标识和差异内容，使回退操作可以精确地将代码恢复到任意历史节点。`setRevert` 和 `clearRevert` 分别设置和清除回退状态。
-
-一个容易产生误解的地方值得澄清：Session.Info 本身不包含 cost 或 tokens 字段。Token 用量和成本追踪在更细粒度的层级——每条 Assistant 消息的 tokens 字段上。`getUsage` 函数负责从 SDK 返回的 `LanguageModelV2Usage` 中提取输入/输出/缓存 token 数，并使用 `Decimal` 精确计算成本（避免浮点误差）。它还处理了不同 provider 的 token 计数差异——Anthropic 的 inputTokens 不含缓存 token，而 OpenRouter 和 OpenAI 的 inputTokens 包含缓存 token，代码通过检测 provider metadata 来决定是否需要扣除。需要统计会话总成本时，按需从所有 Assistant 消息中汇总即可，避免了在 Session 层面维护聚合计数器的一致性问题。
+一个容易产生误解的地方：Session.Info 本身不包含 cost 或 tokens 字段。Token 用量追踪在更细粒度的层级——每条 Assistant 消息的 tokens 字段上。`getUsage` 函数使用 `Decimal` 精确计算成本（避免浮点误差），并处理了 provider 差异——Anthropic 的 inputTokens 不含缓存 token，而 OpenRouter 和 OpenAI 包含，代码通过检测 provider metadata 来决定是否扣除。需要统计会话总成本时，从 Assistant 消息中按需汇总即可。
 
 ## 5.2 Session CRUD 操作
 
-**创建（create）**：`createNext` 函数生成带有降序 ID 的新 Session，自动关联当前项目并设置默认标题。如果配置了自动分享（`Flag.OPENCODE_AUTO_SHARE` 或 `cfg.share === "auto"`），创建后会异步触发分享流程，失败时静默忽略以不影响主流程：
+**创建（create）**：`createNext` 函数生成带有降序 ID 的新 Session，自动关联当前项目。`Database.effect` 将事件发布推迟到事务成功提交后，避免"数据未写入但 UI 已更新"的不一致状态。
 
-```typescript
-// 文件: packages/opencode/src/session/index.ts L297-338
-export async function createNext(input: { ... }) {
-  const result: Info = {
-    id: SessionID.descending(input.id),
-    slug: Slug.create(),
-    version: Installation.VERSION,
-    projectID: Instance.project.id,
-    title: input.title ?? createDefaultTitle(!!input.parentID),
-    time: { created: Date.now(), updated: Date.now() },
-    // ...
-  }
-  Database.use((db) => {
-    db.insert(SessionTable).values(toRow(result)).run()
-    Database.effect(() => Bus.publish(Event.Created, { info: result }))
-  })
-  return result
-}
-```
+**Fork（分叉）**：创建会话副本，可从指定消息处截断。通过 `idMap` 重新映射消息 ID 以维护父子关系，标题自动递增（`"原标题 (fork #1)"` → `"原标题 (fork #2)"`）。
 
-`Database.effect` 的使用值得注意——它将事件发布推迟到数据库事务成功提交之后。如果事务因任何原因回滚，事件不会被发布，从而避免了"数据未写入但 UI 已更新"的不一致状态。默认标题由 `createDefaultTitle` 生成，根据是否为子会话添加不同前缀（`"New session - "` 或 `"Child session - "`），后接 ISO 时间戳。
+**删除（remove）**：递归删除会话及所有子会话，CASCADE 自动清理消息和 Part。
 
-**Fork（分叉）**：`fork` 函数创建一个会话的副本，可以指定从哪条消息截断。它逐条复制消息和 Part，同时通过 `idMap` 重新映射消息 ID 以维护父子关系：
-
-```typescript
-// 文件: packages/opencode/src/session/index.ts L239-280
-export const fork = fn(z.object({
-  sessionID: SessionID.zod,
-  messageID: MessageID.zod.optional(),
-}), async (input) => {
-  const session = await createNext({ title: getForkedTitle(original.title) })
-  const idMap = new Map<string, MessageID>()
-  for (const msg of msgs) {
-    if (input.messageID && msg.info.id >= input.messageID) break
-    const newID = MessageID.ascending()
-    idMap.set(msg.info.id, newID)
-    // 复制消息和 Part，重新映射 parentID
-  }
-  return session
-})
-```
-
-Fork 的标题通过 `getForkedTitle` 生成，支持递增编号（`"原标题 (fork #1)"` → `"原标题 (fork #2)"`）。消息截断使用 ID 比较——因为 Session 中消息按 ID 排序，`>=` 比较天然实现了"从指定消息处截断"的语义。
-
-**删除（remove）**：递归删除会话及其所有子会话，同时取消分享。数据库通过 CASCADE 自动清理关联的消息和 Part。
-
-**列表（list）**：支持按目录、工作区、搜索关键词、时间范围等多维度过滤，默认按更新时间降序排列。`listGlobal` 提供跨项目的全局会话视图，额外支持 `cursor` 分页和 `archived` 过滤。
+**列表（list）**：支持按目录、工作区、关键词、时间等多维度过滤。`listGlobal` 提供跨项目全局视图。
 
 ## 5.3 消息与 Part 管理
 
@@ -192,13 +138,9 @@ if (input.user.system) {
 
 `SessionProcessor` 是 LLM 响应到可视化消息之间的桥梁。它消费 `fullStream` 中的事件流，将每个事件转化为数据库中的 Message Part，同时驱动工具执行和状态管理。
 
-### 初始化与状态变量
+`SessionProcessor.create()` 接收会话上下文和一条空的 Assistant 消息。内部维护 `toolcalls`（进行中的工具调用）、`blocked`（权限阻断）、`attempt`（重试次数）、`needsCompaction`（溢出标记）四个状态变量。
 
-`SessionProcessor.create()` 接收会话上下文和一条空的 Assistant 消息作为容器。Processor 内部维护四个关键状态变量：`toolcalls` 记录进行中的工具调用（按 toolCallID 索引），`blocked` 标记是否被权限拒绝阻断，`attempt` 追踪重试次数，`needsCompaction` 标记是否触发了上下文溢出。
-
-### 事件处理循环
-
-`processor.process(streamInput)` 启动主处理循环。它在 `while(true)` 内调用 `LLM.stream` 获取流，然后遍历 `fullStream` 中的每个事件。完整的事件类型远不止六种——源码中实际处理了十多种事件：
+`processor.process(streamInput)` 在 `while(true)` 内调用 `LLM.stream` 获取流，遍历 `fullStream` 中十多种事件：
 
 ```typescript
 // 文件: packages/opencode/src/session/processor.ts L56-351
@@ -223,37 +165,15 @@ for await (const value of stream.fullStream) {
 }
 ```
 
-每种事件类型对应一个明确的处理逻辑。特别值得注意的是 `text-end` 事件——它不仅持久化文本，还会触发 `Plugin.trigger("experimental.text.complete", ...)` 钩子，允许插件对模型输出进行后处理。`reasoning-end` 则会对文本执行 `trimEnd()` 去除尾部空白。
+`text-end` 事件不仅持久化文本，还触发 `Plugin.trigger("experimental.text.complete", ...)` 钩子允许插件后处理。`reasoning-end` 对文本执行 `trimEnd()` 去除尾部空白。
 
-### finish-step：Cost 与 Token 累计
+### finish-step：Cost、Token 与溢出检测
 
-Token 用量和成本计算集中在 `finish-step` 事件中。Processor 调用 `Session.getUsage()` 从 SDK 的 `usage` 对象中提取各分量：
+`finish-step` 事件中，Processor 调用 `Session.getUsage()` 提取 token 分量并计算成本，累加到 Assistant 消息的 `cost` 字段。同时检查文件变更（`Snapshot.patch()`）、异步计算变更摘要（`SessionSummary.summarize()`），以及调用 `isOverflow` 判断是否需要上下文压缩。
 
-```typescript
-// 文件: packages/opencode/src/session/processor.ts L246-264
-case "finish-step":
-  const usage = Session.getUsage({
-    model: input.model,
-    usage: value.usage,
-    metadata: value.providerMetadata,
-  })
-  input.assistantMessage.finish = value.finishReason
-  input.assistantMessage.cost += usage.cost
-  input.assistantMessage.tokens = usage.tokens
-  await Session.updateMessage(input.assistantMessage)
-```
+### 错误处理与返回值
 
-成本累加到 Assistant 消息的 `cost` 字段上（跨步骤累加），tokens 则每次覆盖为最新值。紧接着，Processor 检查是否产生了文件变更——如果 `snapshot` 存在，调用 `Snapshot.patch()` 计算差异并存储为 patch 类型的 Part。最后调用 `SessionSummary.summarize()` 异步计算变更摘要，并检查上下文是否溢出。
-
-### 错误处理与重试
-
-主循环外的 `catch` 块处理两类错误。`ContextOverflowError` 表示上下文超限，直接设置 `needsCompaction = true`，交由上层处理。其他错误通过 `SessionRetry.retryable()` 判断是否可重试——如果可以，递增 `attempt` 计数器，计算退避延迟后休眠，然后 `continue` 重新进入循环。不可重试的错误记录在 Assistant 消息的 `error` 字段中并广播。
-
-循环结束后，还有一段清理逻辑：遍历所有仍在进行中的工具调用（status 不是 completed 或 error 的），将它们标记为 error 状态并写入 "Tool execution aborted" 错误信息。这确保了即使流被中断，所有 Part 都有明确的终态。
-
-### 返回值语义
-
-`process()` 的返回值驱动上层的控制流：`"continue"` 表示正常完成；`"compact"` 表示 token 溢出，需要先压缩上下文再继续；`"stop"` 表示被阻断（用户取消、权限拒绝、不可恢复错误），应终止处理。
+`ContextOverflowError` 直接触发压缩。其他错误通过 `SessionRetry.retryable()` 判断是否可重试（退避延迟递增），不可重试的错误记录到消息并广播。循环结束后，所有未完成的工具调用被强制标记为 error，确保 Part 有明确终态。`process()` 返回 `"continue"`（正常）、`"compact"`（需压缩）或 `"stop"`（被阻断）驱动上层控制流。
 
 ## 5.6 Tool Call 状态机
 
@@ -315,27 +235,11 @@ case "finish-step":
 
 整个链路中，数据始终"向前流动"：用户消息 → 模型 → 事件流 → Part 更新 → UI。唯一的"回流"发生在工具调用场景——工具结果需要反馈给模型以生成后续响应，这通过 Processor 的 while 循环实现：当一个步骤包含工具调用时，模型会在下一个步骤继续生成，直到不再需要工具为止。
 
-## 5.8 实战：追踪一次完整对话的生命周期
+## 5.8 完整生命周期概览
 
-将上述组件串联起来，一次完整的用户交互经历以下阶段：
+将上述组件串联，一次完整交互的关键阶段为：Session 创建（降序 ID + slug）→ 用户消息写入（upsert + 事件延迟发布）→ Agent 选择与步数检查（`step >= maxSteps` 时注入 `MAX_STEPS`）→ LLM 调用（并行准备 + 分层提示词 + 工具过滤）→ Processor 消费事件流（文本/推理/工具调用各自更新 Part）→ 工具执行（死循环检测 + 权限检查）→ Token 计算与溢出检测 → 状态清理（未完成工具调用标记 error、`SessionSummary.summarize()` 计算变更摘要）。
 
-1. **Session 创建**：`Session.create()` 在数据库中插入新记录，发布 `session.created` 事件。降序 ID 确保新会话在列表顶部，slug 为后续分享和恢复提供简短标识。
-
-2. **用户消息写入**：`SessionPrompt.command()` 接收用户输入，创建 User 类型的 Message 和对应的 Text Part。消息通过 upsert 写入数据库，事件延迟到事务提交后发布。
-
-3. **Agent 选择与步数检查**：根据当前会话状态选择合适的 Agent（默认为 build），加载其权限配置和系统提示词。`prompt.ts` 读取 `agent.steps` 并检查是否到达步数上限——如果 `step >= maxSteps`，注入 `MAX_STEPS` 消息并清空工具列表，迫使模型纯文本回复。
-
-4. **LLM 调用**：`LLM.stream()` 并行获取 Provider、LanguageModel、Auth 信息，构建分层系统提示词，通过 `resolveTools()` 过滤工具集，最终调用 Vercel AI SDK 的 `streamText` 发起流式请求。
-
-5. **响应处理**：`SessionProcessor` 消费流事件，将文本、推理过程、工具调用分别存储为不同类型的 Part。每个 Part 的状态变化都实时持久化并广播。text-end 触发 Plugin 后处理钩子。
-
-6. **工具执行**：模型请求调用工具时，Processor 先进行死循环检测（连续 3 次相同调用触发 `Permission.ask`），再执行工具，将结果作为 tool-result 反馈给模型。`Permission.RejectedError` 和 `Question.RejectedError` 导致 `blocked` 标记被设置。
-
-7. **Token 检查与重试**：每个 step 完成后，`getUsage` 从各 provider 的不同 token 计数方式中统一提取数据，使用 `Decimal` 精确计算成本。同时检查累积 token 是否超出上下文窗口。流级别错误会尝试重试（退避延迟递增），不可重试错误记录到消息上。
-
-8. **状态更新与清理**：`SessionSummary.summarize()` 异步计算代码变更摘要，`Session.touch()` 更新时间戳。所有未完成的工具调用被强制标记为 error 状态，确保 Part 都有明确终态。
-
-整个流程通过 Bus 事件驱动，UI 层监听 `MessageV2.Event.PartUpdated` 和 `MessageV2.Event.PartDelta` 实现实时渲染。事件驱动架构使得 Processor 不需要知道有多少消费者在监听——TUI、Web UI、SSE 客户端都可以独立订阅自己关心的事件。
+整个流程通过 Bus 事件驱动 UI 实时渲染。事件驱动架构使得 Processor 不需要知道有多少消费者在监听——TUI、Web UI、SSE 客户端都可以独立订阅自己关心的事件。
 
 ## 本章要点
 
