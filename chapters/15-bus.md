@@ -1,5 +1,7 @@
 # 第 15 章　事件总线与消息驱动
 
+> "The best architectures are those that minimize coupling between components while maximizing cohesion within them." —— Robert C. Martin
+
 OpenCode 的各个子系统之间通过事件总线进行通信，而非直接调用。这种消息驱动架构实现了模块间的松耦合，使得 Session 层的变化能自动传播到 TUI、SSE 端点和桌面应用。本章深入分析事件总线的类型安全设计和运作机制。
 
 ## 15.1 从直接调用到事件驱动
@@ -168,9 +170,79 @@ function raw(type: string, callback: (event: any) => void) {
 }
 ```
 
-Bus 的状态通过 `Instance.state()` 管理。这个设计意味着每个 Instance 拥有独立的订阅列表——不同项目的事件不会交叉干扰。当 Instance 被释放时，Bus 自动向所有通配符订阅者发送 `InstanceDisposed` 事件，确保资源清理。`once` 方法则基于 `subscribe` 实现了一次性订阅：回调返回 `"done"` 时自动取消订阅，适合等待特定一次性事件（如 worktree 就绪通知）。
+`publish` 在分发时使用扩展运算符 `[...(state().subscriptions.get(key) ?? [])]` 创建订阅者数组的快照。这个看似简单的操作解决了一个微妙的并发问题：如果某个订阅者的回调函数中触发了新的订阅或取消订阅（比如 `once` 方法在回调中取消自身），直接遍历原数组会导致迭代器失效。快照确保了当前分发轮次使用的是一份稳定的订阅者列表，新的订阅/取消操作只影响下一次 `publish`。
 
-## 15.5 Discriminated Union 类型生成
+## 15.5 GlobalBus 与跨 Instance 通信
+
+GlobalBus 是 Bus 系统中容易被忽略但至关重要的一环。它是一个简单的 Node.js `EventEmitter` 实例：
+
+```typescript
+// 文件: packages/opencode/src/bus/global.ts L1-10
+import { EventEmitter } from "events"
+
+export const GlobalBus = new EventEmitter<{
+  event: [
+    {
+      directory?: string
+      payload: any
+    },
+  ]
+}>()
+```
+
+GlobalBus 与 Instance 内部的 Bus 有本质区别。Instance 内部的 Bus 通过 `Instance.state()` 管理订阅列表，每个 Instance 有自己独立的 Map——当用户打开项目 A 时，项目 A 的事件只分发给项目 A 的订阅者。但 GlobalBus 是进程级别的单例，所有 Instance 共享同一个 EventEmitter。
+
+这种双层设计服务于不同的消费场景。TUI 运行在特定 Instance 中，它只需要当前项目的事件，因此通过 `Bus.subscribe` 订阅 Instance 内部的 Bus。而 SSE 端点（HTTP Server 的 `/event` 路由）需要监听所有 Instance 的事件——因为一个 OpenCode 进程可能同时服务多个项目目录，每个 SSE 客户端可能关注不同的项目。SSE 端点通过 `GlobalBus.on("event", ...)` 监听全局事件，然后根据 `directory` 字段过滤出客户端关注的项目。
+
+`publish` 每次调用都同时向两个层面广播，其中 GlobalBus 的 `emit` 携带了 `directory: Instance.directory` 字段，让 SSE 端点能够识别事件来源的项目。这意味着即使多个项目同时活跃，事件也不会串线——桌面应用连接到项目 A 的 SSE 流，只会收到带有项目 A 目录标识的事件。
+
+## 15.6 once 方法与 Bus 生命周期
+
+`once` 方法实现了一次性订阅的语义，其机制值得单独说明：
+
+```typescript
+// 文件: packages/opencode/src/bus/index.ts L78-85
+export function once<Definition extends BusEvent.Definition>(
+  def: Definition,
+  callback: (event: {
+    type: Definition["type"]
+    properties: z.infer<Definition["properties"]>
+  }) => "done" | undefined,
+) {
+  const unsub = subscribe(def, (event) => {
+    if (callback(event)) unsub()
+  })
+}
+```
+
+回调函数返回 `"done"` 字符串时，`once` 调用 `unsub()` 取消订阅。返回 `undefined`（即不返回任何值）则保持订阅继续。这比传统的 `once`（收到第一个事件就取消）更灵活——订阅者可以根据事件内容决定是否"满足条件"。例如，等待某个特定 worktree 就绪时，回调可以检查 `event.properties.name` 是否匹配目标名称，只有匹配时才返回 `"done"`，不匹配则继续等待下一个 `worktree.ready` 事件。
+
+Bus 的生命周期与 Instance 绑定。`Instance.state()` 的第二个参数是一个析构函数，在 Instance 被释放时执行。Bus 的析构逻辑遍历通配符订阅者列表，向每个订阅者发送一个 `InstanceDisposed` 事件：
+
+```typescript
+// 文件: packages/opencode/src/bus/index.ts L23-38
+const state = Instance.state(
+  () => {
+    const subscriptions = new Map<any, Subscription[]>()
+    return { subscriptions }
+  },
+  async (entry) => {
+    const wildcard = entry.subscriptions.get("*")
+    if (!wildcard) return
+    const event = {
+      type: InstanceDisposed.type,
+      properties: { directory: Instance.directory },
+    }
+    for (const sub of [...wildcard]) {
+      sub(event)
+    }
+  },
+)
+```
+
+`InstanceDisposed` 本身也是通过 `BusEvent.define` 定义的事件，类型为 `"server.instance.disposed"`。SSE 端点收到这个事件后会关闭对应的 HTTP 流，避免客户端持有无效连接。这种析构通知机制确保了资源清理的可靠性——即使某个 Instance 因为异常被回收，所有监听者也能收到通知并做出相应处理。值得注意的是，析构函数只通知通配符订阅者（`"*"`），因为精确匹配的订阅者在 Instance 释放后本身也失去了意义——它们订阅的事件类型已经不会再被发布。
+
+## 15.7 Discriminated Union 类型生成
 
 `payloads()` 函数是连接事件系统与 OpenAPI 文档的桥梁：
 
@@ -204,7 +276,7 @@ export function payloads() {
 
 这意味着新增一个事件只需一行 `BusEvent.define()` 调用，它会自动出现在 API 文档和类型系统中。整个注册、聚合、文档生成的流水线完全自动化，开发者无需维护任何额外的配置文件或手动更新 schema。
 
-## 15.6 错误事件的传播机制
+## 15.8 错误事件的传播机制
 
 事件总线不仅用于正常的状态更新，也承担着错误传播的职责。理解错误事件如何在系统中流动，有助于全面掌握事件驱动架构的运作方式。
 
@@ -214,7 +286,7 @@ export function payloads() {
 
 但并非所有错误都等同处理。`Permission.RejectedError` 是一个特殊的错误类型：当用户拒绝了一个权限请求（例如拒绝文件写入权限）时，Processor 不仅发布错误事件，还会中断当前的处理循环。普通错误只影响展示层，而权限拒绝错误会实质性地改变 Processor 的控制流——它告诉系统"用户明确不想继续这个操作"，因此 Processor 应该停止当前的 tool-call 链，而不是尝试下一个工具。
 
-## 15.7 实战：从 tool_call 到 TUI 更新的完整流程
+## 15.9 实战：从 tool_call 到 TUI 更新的完整流程
 
 当 AI 模型返回一个 tool_call 指令时，事件在系统中的传播路径体现了整个事件驱动架构的协作方式。以下序列图展示了一个工具调用从触发到最终在所有客户端上更新显示的完整过程：
 
@@ -246,7 +318,7 @@ Bus 接收后执行双层分发：本地层将事件分发给 TUI 的 `SyncProvi
 
 Processor 不知道有多少客户端在监听。未来新增 VS Code 插件只需连接 SSE 端点，无需修改 Processor 任何代码。
 
-## 15.8 事件驱动架构的工程优势
+## 15.10 事件驱动架构的工程优势
 
 OpenCode 的事件驱动设计带来了显著的工程优势：
 
@@ -258,13 +330,15 @@ OpenCode 的事件驱动设计带来了显著的工程优势：
 
 **生命周期管理**：当 Instance 被释放时，Bus 自动发送 `InstanceDisposed` 事件，SSE 连接据此关闭，不会出现悬挂的订阅。
 
-## 15.9 本章要点
+## 15.11 本章要点
 
 - `BusEvent.define()` 结合 Zod schema 实现类型安全的事件定义，自动注册到全局注册表，新增事件只需一行代码
 - 两个泛型参数 `Type`（字面量字符串）和 `Properties`（ZodType）协同构建编译期类型安全，`publish()` 和 `subscribe()` 各自从 schema 提取输入/输出类型，实现 Discriminated Union 效果
 - 事件命名遵循 `domain[.sub].action` 分层约定，如 `session.created`、`message.part.updated`、`worktree.ready`，名称反映业务语义而非 CRUD 操作
-- Bus 实现发布/订阅模式，支持精确匹配和通配符订阅，返回取消函数管理生命周期
+- Bus 实现发布/订阅模式，支持精确匹配和通配符订阅，返回取消函数管理生命周期；`publish` 使用扩展运算符创建订阅者快照，避免回调中修改订阅列表导致的迭代器失效
+- GlobalBus 是进程级 EventEmitter 单例，与 Instance 内部 Bus 形成双层架构：本地 Bus 服务 TUI 等进程内消费者，GlobalBus 携带 `directory` 字段服务 SSE 端点等跨 Instance 消费者
+- `once` 方法通过回调返回 `"done"` 实现条件性一次性订阅，比传统 `once` 更灵活
+- Instance 释放时析构函数向通配符订阅者发送 `InstanceDisposed` 事件（类型 `"server.instance.disposed"`），SSE 端点据此关闭连接，避免资源泄漏
 - `payloads()` 函数将所有事件聚合为 discriminated union，自动生成 OpenAPI schema，实现定义-注册-文档全流水线自动化
 - 错误事件通过同一 Bus 传播，`Permission.RejectedError` 会中断 Processor 循环而非仅展示错误
 - 事件驱动架构实现模块松耦合、多客户端同步和可测试性
-- 双层广播（Instance 本地 + GlobalBus）支持跨实例通信，每个 Instance 拥有独立的订阅列表互不干扰

@@ -1,5 +1,7 @@
 # 第 4 章　Agent 架构与内置角色
 
+> "The key to artificial intelligence has always been the representation." —— Jeff Hawkins
+
 在 AI 编程助手中，Agent 是连接用户意图与工具执行的核心抽象。OpenCode 通过一套精巧的 Agent 体系，将不同场景下的能力需求映射为不同的角色配置。本章将深入分析 Agent 的类型定义、七大内置角色的设计思路，以及权限隔离与自定义扩展机制。
 
 > **源码位置**：packages/opencode/src/agent/agent.ts
@@ -43,6 +45,14 @@ export const Info = z
 - **`"all"`**：两种模式皆可，既能作为主 Agent 直接与用户交互，也能被其他 Agent 调用。用户通过配置文件自定义的 Agent 默认使用此模式。
 
 子 Agent 的存在是为了让主 Agent 拥有"委派"能力——当 build Agent 面对一个需要大量文件搜索的子任务时，它可以把这项工作交给 explore，后者带有专门优化过的只读工具集和系统提示词。这种委派机制让每个 Agent 都保持职责单一，而不是把所有能力堆砌在一个 Agent 上。
+
+### Subagent 调用的完整链路
+
+理解 subagent 的委派机制，需要追踪一次完整的调用链路。当 build Agent 决定将一个子任务委派给 general 或 explore 时，它会调用 Task 工具。Task 工具是 OpenCode 中的一个特殊内置工具，其核心职责是在独立的子会话中启动一个子 Agent。
+
+调用链路如下：build Agent 在当前会话中生成一个 `tool_call`，指定工具名为 `task`，输入参数中包含子 Agent 名称（如 `"explore"`）和任务描述。Processor 接收到这个 tool_call 后，Task 工具的 `execute` 函数创建一条新的子会话——这条子会话拥有独立的消息历史和上下文窗口，不与父会话共享对话内容。子会话以 `explore` 作为 Agent 身份启动一轮新的 `prompt` 调用，传入任务描述作为用户消息。explore Agent 在自己的上下文中执行搜索操作，可能多次调用 grep、glob、read 等工具，每次调用都在子会话内独立进行权限评估。子 Agent 完成后，其最终的文本回复被提取出来，作为 Task 工具的 `result` 返回给父会话的 Processor。build Agent 看到的是 Task 工具的输出——一段文本摘要，它不知道子会话内部经历了多少轮工具调用。
+
+这种设计的优势在于上下文隔离。子 Agent 执行大量搜索操作产生的中间结果（文件内容、grep 输出等）只存在于子会话的上下文窗口中，不会污染父会话有限的上下文空间。父会话只接收最终结论，保持了上下文的精简。同时，build Agent 可以并行启动多个 Task 工具调用，每个在独立的子会话中运行，实现真正的并行研究。
 
 ### Agent 选择的决策路径
 
@@ -150,7 +160,17 @@ OpenCode 预定义了七个内置 Agent，分为三个层次。
 
 这三个隐藏 Agent 共享一个关键决策：`hidden: true`。虽然它们的 mode 都设为 `"primary"`，但 hidden 标志使其只能被系统内部代码通过 `Agent.get("compaction")` 等方式直接获取。在源码中，`defaultAgent()` 函数显式排除 `hidden === true` 的 Agent，UI 层渲染时也会过滤掉隐藏角色。这种"负空间"设计消除了用户误操作的可能——想象一下，如果用户不小心切换到 compaction Agent 然后尝试编写代码，所有工具都被禁用，体验将非常糟糕。`hidden: true` 从 UI 层面消除了这种可能。
 
-## 4.3 权限隔离机制
+## 4.3 Permission.ask() 的挂起机制
+
+当一个工具调用的权限评估结果为 `"ask"` 时，执行流需要暂停等待用户决策。这个挂起机制的实现依赖 Effect 框架的 `Deferred` 原语，其工作过程值得详细展开。
+
+`Permission.ask()` 函数首先遍历请求中的所有 patterns，逐一调用 `evaluate` 函数匹配规则集。如果任何 pattern 匹配到 `"deny"` 规则，立即返回 `DeniedError`；如果所有 pattern 都匹配到 `"allow"`，直接放行。只有当至少一个 pattern 匹配到 `"ask"` 时，流程才进入挂起状态。
+
+进入挂起后，函数创建一个 `Deferred` 对象——这是 Effect 框架中的异步等待原语，类似于一个可以在外部 resolve 或 reject 的 Promise。请求信息被存入 `pending` Map，同时通过 `Bus.publish(Event.Asked, info)` 将权限请求事件广播出去。TUI 层的 SyncProvider 接收到 `permission.asked` 事件后，在界面上展示权限确认对话框，显示工具名称、操作类型和涉及的文件路径，等待用户选择 allow（本次允许）、always（永久允许）或 reject（拒绝）。
+
+此时 `Permission.ask()` 的调用方——通常是 `prompt.ts` 中的工具执行链路——处于 `Deferred.await(deferred)` 的等待状态，整个 Processor 的处理循环被暂停。当用户做出选择后，TUI 通过 SDK 调用 `Permission.reply()`，后者从 `pending` Map 中取出对应的 Deferred 并 resolve 或 reject 它。如果用户选择 `"always"`，系统还会将新的 allow 规则追加到 `approved` 规则集中并持久化到数据库，后续相同的权限请求将直接放行不再打扰用户。如果用户选择 `"reject"`，`Deferred.fail` 触发 `RejectedError`，Processor 捕获这个错误后不仅中断当前工具调用，还会级联取消同一会话中所有待处理的权限请求——因为用户拒绝了一个操作，通常意味着他希望中断整个操作链路，而非逐一审批后续请求。
+
+## 4.4 权限隔离机制
 
 ### 三层合并的工作原理
 
@@ -233,9 +253,45 @@ explore: {
 
 "先拒绝再白名单"模式天然兼容未来新增工具。explore 还单独声明了 `external_directory` 规则，白名单目录（`Truncate.GLOB` 和 skill 目录）设为 allow，其他外部目录设为 ask。
 
-## 4.4 自定义 Agent 与 Truncate 保障
+## 4.5 Agent.generate()：AI 生成 Agent 配置
 
-OpenCode 支持通过配置文件和 AI 自动生成两种方式自定义 Agent。`state()` 函数后半段遍历 `cfg.agent` 中的自定义配置，支持覆盖现有 Agent 的模型、提示词、温度等参数，也支持通过 `disable: true` 禁用内置 Agent。对于不存在的 key，系统会创建全新的 Agent，默认 mode 为 `"all"`，权限继承全局默认值和用户配置。`generate` 函数使用 `temperature: 0.3` 调用 LLM 生成结构化配置——生成配置需要可预测性和结构化输出，但也不能完全抹杀创造性。生成前会将已有 Agent 名称列表注入提示词，避免重名冲突。
+`generate` 函数提供了一种独特的扩展方式——用户描述想要的 Agent 行为，由 LLM 自动生成结构化的 Agent 配置。整个过程经过精心设计以确保输出质量。
+
+```typescript
+// 文件: packages/opencode/src/agent/agent.ts L287-342
+export async function generate(input: { description: string; model?: ... }) {
+  const cfg = await Config.get()
+  const defaultModel = input.model ?? (await Provider.defaultModel())
+  const model = await Provider.getModel(defaultModel.providerID, defaultModel.modelID)
+  const language = await Provider.getLanguage(model)
+  const system = [PROMPT_GENERATE]
+  await Plugin.trigger("experimental.chat.system.transform", { model }, { system })
+  const existing = await list()
+  const params = {
+    temperature: 0.3,
+    messages: [
+      ...system.map((item): ModelMessage => ({ role: "system", content: item })),
+      {
+        role: "user",
+        content: `Create an agent configuration based on this request: "${input.description}".\n\nIMPORTANT: The following identifiers already exist and must NOT be used: ${existing.map((i) => i.name).join(", ")}\n  Return ONLY the JSON object...`,
+      },
+    ],
+    model: language,
+    schema: z.object({
+      identifier: z.string(),
+      whenToUse: z.string(),
+      systemPrompt: z.string(),
+    }),
+  }
+  // ...
+}
+```
+
+函数使用 `temperature: 0.3` 调用 LLM——生成配置需要可预测性和结构化输出，但也不能完全抹杀创造性，0.3 比默认值低但不至于过于死板。生成前将已有 Agent 名称列表注入提示词，明确要求 LLM 不能使用已有名称，避免重名覆盖内置 Agent。输出 schema 约束为三个字段：`identifier`（唯一标识）、`whenToUse`（使用场景描述，作为 description 注入工具提示）和 `systemPrompt`（系统提示词）。生成过程还会经过 Plugin 系统的 `experimental.chat.system.transform` 钩子，允许插件修改系统提示词以注入额外的生成指导。对于 OpenAI 的 OAuth 认证场景，函数退化为 `streamObject` 模式以兼容 API 限制。
+
+## 4.6 自定义 Agent 与 Truncate 保障
+
+OpenCode 支持通过配置文件和 AI 自动生成两种方式自定义 Agent。`state()` 函数后半段遍历 `cfg.agent` 中的自定义配置，支持覆盖现有 Agent 的模型、提示词、温度等参数，也支持通过 `disable: true` 禁用内置 Agent。对于不存在的 key，系统会创建全新的 Agent，默认 mode 为 `"all"`，权限继承全局默认值和用户配置。配置覆盖的粒度非常细——用户可以只修改某个内置 Agent 的 temperature 而保留其余所有设置不变，也可以为自定义 Agent 指定专用模型（如用 Claude 做编码、用 GPT-4o 做文件探索）。`mergeDeep` 用于合并 `options` 字段，确保 Provider 扩展选项能被增量修改而非整体替换。
 
 无论内置还是自定义 Agent，系统最后都执行 Truncate 保障检查：
 
@@ -261,10 +317,13 @@ for (const name in result) {
 
 - Agent.Info 通过 Zod schema 定义了包含名称、模式、权限、模型、提示词等字段的完整配置结构
 - `mode` 字段划分三种角色：`primary` 直接与用户交互，`subagent` 只能被委派调用，`all` 兼具两种能力
+- Subagent 通过 Task 工具在独立子会话中运行，上下文隔离避免污染父会话，结果以文本摘要形式返回
 - `defaultAgent()` 包含三层验证（存在性、非 subagent、非 hidden），确保默认 Agent 选择的安全性
 - `steps` 字段与 `DOOM_LOOP_THRESHOLD` 构成两层循环防御：前者限制总步数，后者通过 JSON 级别的参数比较检测重复模式
 - 七大内置 Agent 分三个层次：build/plan 面向用户，general/explore 为子 Agent，compaction/title/summary 为隐藏基础设施
 - 隐藏 Agent 的 `hidden: true` 是一种"负空间"设计——mode 虽为 `primary`，但 hidden 标志使其从 UI 和默认选择中被彻底排除
+- `Permission.ask()` 通过 Effect 的 `Deferred` 原语实现执行流挂起，Bus 事件驱动 TUI 显示确认对话框，用户 reject 时级联取消同会话所有待处理请求
 - 权限隔离采用三层合并策略（默认 → Agent 特有 → 用户覆盖），三种权限值对应三种运行时行为
 - explore Agent 使用"先拒绝再白名单"的最小权限原则，天然兼容未来新增工具
+- `Agent.generate()` 使用 `temperature: 0.3` 调用 LLM 生成结构化配置，注入已有名称列表防止重名
 - 系统对所有 Agent 强制注入 Truncate.GLOB 访问权限，确保核心功能不因权限配置缺失而中断
